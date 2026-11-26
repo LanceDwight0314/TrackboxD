@@ -1,859 +1,1552 @@
 import hashlib
-import hmac
 import os
-import random
 import sqlite3
 import sys
-from pathlib import Path
+import json
+import urllib.parse
+import urllib.request
+from PyQt6.QtGui import QDesktopServices
+from yt_dlp import YoutubeDL
 
-import requests
-from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QTabWidget, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget
-)
-from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtCore import QThread, QUrl, Qt, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineHttpRequest
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-# Paste your YouTube Data API v3 key between the quotation marks.
-# You can create one in Google Cloud Console after enabling YouTube Data API v3.
-YOUTUBE_API_KEY = "PASTE_YOUR_YOUTUBE_API_KEY_HERE"
 DB_NAME = "trackboxd.db"
-PASSWORD_ITERATIONS = 260_000
 
 
-def connect_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
+# --- DATABASE SETUP ---
 def init_db():
-    with connect_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash BLOB NOT NULL,
-                salt BLOB NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS watch_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                search_query TEXT NOT NULL,
-                media_title TEXT NOT NULL,
-                video_id TEXT,
-                searched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
-        history_columns = {row[1] for row in conn.execute("PRAGMA table_info(watch_history)").fetchall()}
-        if "video_id" not in history_columns:
-            conn.execute("ALTER TABLE watch_history ADD COLUMN video_id TEXT")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                media_title TEXT NOT NULL,
-                rating INTEGER NOT NULL,
-                comment TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS quiz_songs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                artist TEXT NOT NULL,
-                file_path TEXT NOT NULL UNIQUE
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS game_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                score INTEGER NOT NULL,
-                total_questions INTEGER NOT NULL,
-                played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash BLOB NOT NULL,
+            salt BLOB NOT NULL
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            media_title TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            comment TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """
+    )
+
+    conn.commit()
+    conn.close()
 
 
 def hash_password(password, salt=None):
     if salt is None:
         salt = os.urandom(16)
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS
+    key = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 100000
     )
-    return password_hash, salt
+    return key, salt
 
 
-class YouTubeSearchThread(QThread):
-    results_ready = pyqtSignal(list)
-    error_occurred = pyqtSignal(str)
+# --- BACKGROUND THREAD FOR YOUTUBE SEARCH ---
+class YTFetchThread(QThread):
+    finished_signal = pyqtSignal(str, str, str)
+    error_signal = pyqtSignal(str)
 
-    def __init__(self, query, api_key, parent=None):
-        super().__init__(parent)
-        self.query = query
-        self.api_key = api_key
+    def __init__(self, search_query):
+        super().__init__()
+        self.search_query = search_query
 
     def run(self):
         try:
-            endpoint = "https://www.googleapis.com/youtube/v3/search"
-            params = {
-                "part": "snippet", "type": "video", "maxResults": 10,
-                "q": self.query, "key": self.api_key
+            ydl_opts = {
+                "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+                "quiet": True,
+                "noplaylist": True,
+                "default_search": "ytsearch1:",
+                "js_runtimes": {"node": {}},
+                "remote_components": ["ejs:github"],
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["ios", "android", "web"],
+                    }
+                },
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             }
-            response = requests.get(endpoint, params=params, timeout=20)
-            response.raise_for_status()
-            payload = response.json()
-            results = []
-            for item in payload.get("items", []):
-                video_id = item.get("id", {}).get("videoId")
-                snippet = item.get("snippet", {})
-                if video_id:
-                    results.append({
-                        "video_id": video_id,
-                        "title": snippet.get("title", "Untitled video"),
-                        "channel": snippet.get("channelTitle", "Unknown channel"),
-                        "description": snippet.get("description", "")
-                    })
-            self.results_ready.emit(results)
-        except requests.HTTPError as exc:
-            message = "YouTube API request failed. Check your API key, quota, and API settings."
-            try:
-                details = exc.response.json().get("error", {}).get("message", "")
-                if details:
-                    message += f"\n\nDetails: {details}"
-            except Exception:
-                pass
-            self.error_occurred.emit(message)
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.search_query, download=False)
+                if "entries" in info and len(info["entries"]) > 0:
+                    video = info["entries"][0]
+                else:
+                    video = info
+
+                stream_url = video.get("url")
+                title = video.get("title", self.search_query)
+                description = video.get(
+                    "description", "No description provided for this release."
+                )
+
+                if stream_url:
+                    self.finished_signal.emit(stream_url, title, description)
+                else:
+                    self.error_signal.emit(
+                        "Could not extract stream URL for this video."
+                    )
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class CatalogFetchThread(QThread):
+    results_signal = pyqtSignal(str, list)
+    error_signal = pyqtSignal(str, str)
+
+    def __init__(self, category, query):
+        super().__init__()
+        self.category = category
+        self.query = query
+
+    def run(self):
+        try:
+            if self.category == "Music":
+                params = urllib.parse.urlencode({
+                    "term": self.query,
+                    "entity": "song",
+                    "limit": 18
+                })
+                url = "https://itunes.apple.com/search?" + params
+
+            elif self.category == "Movies":
+                api_key = os.environ.get("YOUTUBE_API_KEY")
+
+                if not api_key:
+                    raise Exception("YouTube API key not found.")
+
+                params = urllib.parse.urlencode({
+                    "part": "snippet",
+                    "q": self.query,
+                    "type": "video",
+                    "maxResults": 25,
+                    "key": api_key
+                })
+
+                url = "https://www.googleapis.com/youtube/v3/search?" + params
+
+            else:
+                params = urllib.parse.urlencode({
+                    "term": self.query,
+                    "cc": "ph",
+                    "l": "en",
+                    "count": 25
+                })
+                url = "https://store.steampowered.com/api/storesearch/?" + params
+
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "TRACKBOXD/1.0"}
+            )
+
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+            if self.category == "Music":
+                results = payload.get("results", [])
+            else:
+                results = payload.get("items", [])
+
+            self.results_signal.emit(self.category, results)
+
         except Exception as exc:
-            self.error_occurred.emit(str(exc))
+            self.error_signal.emit(self.category, str(exc))
 
 
-class TrackboxdApp(QMainWindow):
+# --- MAIN APPLICATION ---
+
+
+
+class TrackboxdApp(QStackedWidget):
+
+    def open_snake_game(self):
+        if not hasattr(self, "game_page"):
+            self.game_page = QWidget()
+            game_layout = QVBoxLayout(self.game_page)
+
+            back_button = QPushButton("← Back to Games")
+            back_button.setObjectName("ControlButton")
+            back_button.setMinimumHeight(40)
+            back_button.clicked.connect(
+                lambda: self.content_stack.setCurrentIndex(3)
+            )
+
+            self.game_view = QWebEngineView()
+
+            game_path = os.path.abspath(
+                os.path.join("games", "snake.html")
+            )
+
+            self.game_view.setUrl(
+                QUrl.fromLocalFile(game_path)
+            )
+
+            game_layout.addWidget(back_button)
+            game_layout.addWidget(self.game_view, 1)
+
+            self.content_stack.addWidget(self.game_page)
+
+        self.content_stack.setCurrentWidget(self.game_page)
+
+    def open_tictactoe_game(self):
+        if not hasattr(self, "tictactoe_page"):
+            self.tictactoe_page = QWidget()
+            game_layout = QVBoxLayout(self.tictactoe_page)
+
+            back_button = QPushButton("← Back to Games")
+            back_button.setObjectName("ControlButton")
+            back_button.setMinimumHeight(40)
+            back_button.clicked.connect(
+                lambda: self.content_stack.setCurrentIndex(3)
+            )
+
+            self.tictactoe_view = QWebEngineView()
+
+            game_path = os.path.abspath(
+                os.path.join("games", "tictactoe.html")
+            )
+
+            self.tictactoe_view.setUrl(
+                QUrl.fromLocalFile(game_path)
+            )
+
+            game_layout.addWidget(back_button)
+            game_layout.addWidget(self.tictactoe_view, 1)
+
+            self.content_stack.addWidget(self.tictactoe_page)
+
+        self.content_stack.setCurrentWidget(self.tictactoe_page)
+
     def __init__(self):
         super().__init__()
+
         self.current_user_id = None
         self.current_username = ""
-        self.search_thread = None
-        self.current_video_id = None
-        self.pending_query = ""
-        self.music_files = []
-        self.quiz_questions = []
-        self.quiz_index = 0
-        self.quiz_score = 0
-        self.quiz_total = 10
-        self.current_question = None
-        self.answer_locked = False
 
-        self.music_player = QMediaPlayer(self)
-        self.music_output = QAudioOutput(self)
-        self.music_player.setAudioOutput(self.music_output)
-        self.music_output.setVolume(0.7)
+        # Views
+        self.login_screen = QWidget()
+        self.register_screen = QWidget()
+        self.main_screen = QWidget()
 
-        self.game_player = QMediaPlayer(self)
-        self.game_output = QAudioOutput(self)
-        self.game_player.setAudioOutput(self.game_output)
-        self.game_output.setVolume(0.8)
-        self.clip_timer = QTimer(self)
-        self.clip_timer.setSingleShot(True)
-        self.clip_timer.timeout.connect(self.stop_quiz_clip)
-        self.game_player.mediaStatusChanged.connect(self.handle_quiz_media_status)
-        self.waiting_for_quiz_clip = False
-        self.quiz_clip_duration_ms = 3000
+        self.addWidget(self.login_screen)
+        self.addWidget(self.register_screen)
+        self.addWidget(self.main_screen)
 
-        self.setWindowTitle("Trackboxd | Media and Entertainment")
-        self.resize(1200, 850)
-        self.build_auth_pages()
-        self.apply_styles()
-        self.show_login()
+        self.setup_login_ui()
+        self.setup_register_ui()
+        self.setup_main_ui()
 
-    # ---------------- AUTHENTICATION ----------------
-    def build_auth_pages(self):
-        self.stack = QTabWidget()
-        self.stack.tabBar().hide()
-        self.setCentralWidget(self.stack)
+        self.setWindowTitle("Trackboxd — Music Video Journal")
+        self.resize(1200, 800)
+        self.setMinimumSize(900, 600)
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
 
-        login_page = QWidget()
-        login_outer = QVBoxLayout(login_page)
-        login_outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        login_card = QFrame()
-        login_card.setObjectName("AuthCard")
-        login_card.setFixedWidth(430)
-        login_layout = QVBoxLayout(login_card)
-        login_layout.setContentsMargins(35, 35, 35, 35)
+        self.apply_professional_stylesheet()
+
+    def setup_login_ui(self):
+        outer = QVBoxLayout()
+
+
+    # --- PAGE 0: LOGIN UI ---
+    def setup_login_ui(self):
+        outer = QVBoxLayout()
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        card = QFrame()
+        card.setFixedWidth(410)
+        card.setObjectName("AuthCard")
+
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(36, 40, 36, 40)
+
         logo = QLabel("TRACKBOXD")
-        logo.setObjectName("AuthLogo")
+        logo.setObjectName("BrandLogoAuth")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle = QLabel("Your space for music, videos, and games")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setObjectName("Muted")
+
+        sub = QLabel("Log in to your music journal")
+        sub.setObjectName("BrandSubAuth")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.login_username = QLineEdit()
         self.login_username.setPlaceholderText("Username")
+
         self.login_password = QLineEdit()
         self.login_password.setPlaceholderText("Password")
         self.login_password.setEchoMode(QLineEdit.EchoMode.Password)
+
         login_btn = QPushButton("Log In")
-        login_btn.setObjectName("Primary")
+        login_btn.setObjectName("PrimaryLogBtn")
         login_btn.clicked.connect(self.handle_login)
-        register_link = QPushButton("Create an account")
-        register_link.setObjectName("LinkButton")
-        register_link.clicked.connect(lambda: self.stack.setCurrentIndex(1))
-        self.login_message = QLabel("")
-        self.login_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        for widget in (logo, subtitle, self.login_username, self.login_password,
-                       login_btn, register_link, self.login_message):
-            login_layout.addWidget(widget)
-        login_outer.addWidget(login_card)
-        self.stack.addTab(login_page, "Login")
 
-        register_page = QWidget()
-        register_outer = QVBoxLayout(register_page)
-        register_outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        register_card = QFrame()
-        register_card.setObjectName("AuthCard")
-        register_card.setFixedWidth(430)
-        register_layout = QVBoxLayout(register_card)
-        register_layout.setContentsMargins(35, 35, 35, 35)
-        register_logo = QLabel("CREATE ACCOUNT")
-        register_logo.setObjectName("AuthLogo")
-        register_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.register_username = QLineEdit()
-        self.register_username.setPlaceholderText("Username")
-        self.register_password = QLineEdit()
-        self.register_password.setPlaceholderText("Password (10+ characters)")
-        self.register_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.register_confirm = QLineEdit()
-        self.register_confirm.setPlaceholderText("Confirm password")
-        self.register_confirm.setEchoMode(QLineEdit.EchoMode.Password)
-        create_btn = QPushButton("Create Account")
-        create_btn.setObjectName("Primary")
-        create_btn.clicked.connect(self.handle_register)
-        back_btn = QPushButton("Back to login")
-        back_btn.setObjectName("LinkButton")
-        back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        self.register_message = QLabel("")
-        self.register_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        for widget in (register_logo, self.register_username, self.register_password,
-                       self.register_confirm, create_btn, back_btn, self.register_message):
-            register_layout.addWidget(widget)
-        register_outer.addWidget(register_card)
-        self.stack.addTab(register_page, "Register")
+        go_to_reg_btn = QPushButton("Don't have an account? Register")
+        go_to_reg_btn.setObjectName("SecondaryBtn")
+        go_to_reg_btn.clicked.connect(lambda: self.setCurrentIndex(1))
 
-    def show_login(self):
-        self.stack.setCurrentIndex(0)
+        self.login_msg = QLabel("")
+        self.login_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        card_layout.addWidget(logo)
+        card_layout.addWidget(sub)
+        card_layout.addSpacing(20)
+        card_layout.addWidget(self.login_username)
+        card_layout.addWidget(self.login_password)
+        card_layout.addSpacing(12)
+        card_layout.addWidget(login_btn)
+        card_layout.addWidget(go_to_reg_btn)
+        card_layout.addWidget(self.login_msg)
+
+        outer.addWidget(card)
+        self.login_screen.setLayout(outer)
+
+    # --- PAGE 1: REGISTER UI ---
+    def setup_register_ui(self):
+        outer = QVBoxLayout()
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        card = QFrame()
+        card.setFixedWidth(410)
+        card.setObjectName("AuthCard")
+
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(36, 40, 36, 40)
+
+        logo = QLabel("TRACKBOXD")
+        logo.setObjectName("BrandLogoAuth")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        sub = QLabel("Create a new listener profile")
+        sub.setObjectName("BrandSubAuth")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.reg_username = QLineEdit()
+        self.reg_username.setPlaceholderText("Choose a Username")
+
+        self.reg_password = QLineEdit()
+        self.reg_password.setPlaceholderText("Choose a Password")
+        self.reg_password.setEchoMode(QLineEdit.EchoMode.Password)
+
+        reg_btn = QPushButton("Create Account")
+        reg_btn.setObjectName("PrimaryLogBtn")
+        reg_btn.clicked.connect(self.handle_register)
+
+        go_to_login_btn = QPushButton("Already have an account? Log In")
+        go_to_login_btn.setObjectName("SecondaryBtn")
+        go_to_login_btn.clicked.connect(lambda: self.setCurrentIndex(0))
+
+        self.reg_msg = QLabel("")
+        self.reg_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        card_layout.addWidget(logo)
+        card_layout.addWidget(sub)
+        card_layout.addSpacing(20)
+        card_layout.addWidget(self.reg_username)
+        card_layout.addWidget(self.reg_password)
+        card_layout.addSpacing(12)
+        card_layout.addWidget(reg_btn)
+        card_layout.addWidget(go_to_login_btn)
+        card_layout.addWidget(self.reg_msg)
+
+        outer.addWidget(card)
+        self.register_screen.setLayout(outer)
+
+    # --- AUTH LOGIC ---
     def handle_register(self):
-        username = self.register_username.text().strip()
-        password = self.register_password.text()
-        confirm = self.register_confirm.text()
-        if not username or not password or not confirm:
-            self.register_message.setText("Please complete all fields.")
+        username = self.reg_username.text().strip()
+        password = self.reg_password.text().strip()
+
+        if not username or not password:
+            self.show_msg(self.reg_msg, "Please complete all fields.", True)
             return
-        if len(username) < 4 or not username.replace("_", "").isalnum():
-            self.register_message.setText("Use at least 4 letters/numbers. Underscores are allowed.")
-            return
-        if len(password) < 10 or not any(c.isupper() for c in password) or \
-           not any(c.islower() for c in password) or not any(c.isdigit() for c in password):
-            self.register_message.setText("Password needs 10+ characters, uppercase, lowercase, and a number.")
-            return
-        if password != confirm:
-            self.register_message.setText("Passwords do not match.")
-            return
-        password_hash, salt = hash_password(password)
+
+        key, salt = hash_password(password)
         try:
-            with connect_db() as conn:
-                conn.execute(
-                    "INSERT INTO users(username, password_hash, salt) VALUES (?, ?, ?)",
-                    (username, password_hash, salt)
-                )
-            QMessageBox.information(self, "Account created", "You can now log in.")
-            self.register_username.clear()
-            self.register_password.clear()
-            self.register_confirm.clear()
-            self.stack.setCurrentIndex(0)
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)",
+                (username, key, salt),
+            )
+            conn.commit()
+            conn.close()
+
+            QMessageBox.information(
+                self,
+                "Success",
+                "Account created successfully! Redirecting to login...",
+            )
+            self.reg_username.clear()
+            self.reg_password.clear()
+            self.setCurrentIndex(0)
+
         except sqlite3.IntegrityError:
-            self.register_message.setText("That username is already taken.")
+            self.show_msg(
+                self.reg_msg, f"Username '{username}' already taken.", True
+            )
 
     def handle_login(self):
         username = self.login_username.text().strip()
-        password = self.login_password.text()
-        with connect_db() as conn:
-            row = conn.execute(
-                "SELECT id, password_hash, salt FROM users WHERE username = ?", (username,)
-            ).fetchone()
-        if not row:
-            self.login_message.setText("Invalid username or password.")
-            return
-        user_id, stored_hash, salt = row
-        entered_hash, _ = hash_password(password, salt)
-        if not hmac.compare_digest(entered_hash, stored_hash):
-            self.login_message.setText("Invalid username or password.")
-            return
-        self.current_user_id = user_id
-        self.current_username = username
-        self.build_dashboard()
-        self.stack.setCurrentIndex(2)
+        password = self.login_password.text().strip()
 
-    # ---------------- MAIN DASHBOARD ----------------
-    def build_dashboard(self):
-        if self.stack.count() > 2:
-            old_page = self.stack.widget(2)
-            self.stack.removeTab(2)
-            old_page.deleteLater()
-        page = QWidget()
-        root = QVBoxLayout(page)
-        root.setContentsMargins(22, 16, 22, 22)
-        header = QHBoxLayout()
-        brand = QLabel("TRACKBOXD")
-        brand.setObjectName("Brand")
-        self.user_badge = QLabel(f"@{self.current_username}")
-        self.user_badge.setObjectName("UserBadge")
-        logout = QPushButton("Log Out")
-        logout.clicked.connect(self.logout)
-        header.addWidget(brand)
-        header.addStretch()
-        header.addWidget(self.user_badge)
-        header.addWidget(logout)
-        root.addLayout(header)
-
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs)
-        self.build_youtube_tab()
-        self.build_music_tab()
-        self.build_game_tab()
-        self.build_community_tab()
-        self.stack.addTab(page, "Dashboard")
-        self.load_history()
-        self.load_reviews()
-        self.load_quiz_songs()
-
-    # ---------------- YOUTUBE TAB ----------------
-    def build_youtube_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        search_row = QHBoxLayout()
-        self.youtube_search = QLineEdit()
-        self.youtube_search.setPlaceholderText("Search YouTube videos, songs, or artists...")
-        self.youtube_search.returnPressed.connect(self.search_youtube)
-        search_btn = QPushButton("Search YouTube")
-        search_btn.setObjectName("Primary")
-        search_btn.clicked.connect(self.search_youtube)
-        search_row.addWidget(self.youtube_search, 1)
-        search_row.addWidget(search_btn)
-        layout.addLayout(search_row)
-
-        key_note = QLabel("YouTube search uses your YouTube Data API v3 key. Playback stays embedded below.")
-        key_note.setObjectName("Muted")
-        layout.addWidget(key_note)
-
-        body = QHBoxLayout()
-        self.youtube_results = QListWidget()
-        self.youtube_results.setMinimumWidth(310)
-        self.youtube_results.itemDoubleClicked.connect(self.play_selected_video)
-        body.addWidget(self.youtube_results, 1)
-
-        player_column = QVBoxLayout()
-        self.youtube_player = QWebEngineView()
-        self.youtube_player.setMinimumHeight(430)
-        settings = self.youtube_player.settings()
-        settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
-        self.youtube_player.setHtml("<html><body style='background:#080d18;color:#cbd5e1;font-family:Arial;display:grid;place-items:center;height:100vh'><h2>Search and select a video to play</h2></body></html>")
-        self.youtube_title = QLabel("No video selected")
-        self.youtube_title.setObjectName("SectionTitle")
-        self.youtube_description = QTextEdit()
-        self.youtube_description.setReadOnly(True)
-        self.youtube_description.setMaximumHeight(95)
-        player_column.addWidget(self.youtube_player, 1)
-        player_column.addWidget(self.youtube_title)
-        player_column.addWidget(self.youtube_description)
-        body.addLayout(player_column, 2)
-        layout.addLayout(body, 1)
-
-        self.history_table = QTableWidget(0, 3)
-        self.history_table.setHorizontalHeaderLabels(["Search", "Video", "Played at"])
-        self.history_table.horizontalHeader().setStretchLastSection(True)
-        self.history_table.setMaximumHeight(150)
-        layout.addWidget(QLabel("RECENTLY PLAYED"))
-        layout.addWidget(self.history_table)
-        self.tabs.addTab(page, "YouTube")
-
-    def search_youtube(self):
-        query = self.youtube_search.text().strip()
-        if not query:
-            QMessageBox.warning(self, "Search", "Enter a search term first.")
-            return
-        if not YOUTUBE_API_KEY or YOUTUBE_API_KEY == "PASTE_YOUR_YOUTUBE_API_KEY_HERE":
-            QMessageBox.warning(
-                self, "API key needed",
-                "Open the Python file and replace PASTE_YOUR_YOUTUBE_API_KEY_HERE with your YouTube Data API v3 key."
-            )
-            return
-        if self.search_thread and self.search_thread.isRunning():
-            return
-        self.youtube_results.clear()
-        self.youtube_results.addItem("Searching YouTube...")
-        self.pending_query = query
-        self.search_thread = YouTubeSearchThread(query, YOUTUBE_API_KEY, self)
-        self.search_thread.results_ready.connect(self.show_youtube_results)
-        self.search_thread.error_occurred.connect(self.show_youtube_error)
-        self.search_thread.start()
-
-    def show_youtube_results(self, results):
-        self.youtube_results.clear()
-        if not results:
-            self.youtube_results.addItem("No videos found.")
-            return
-        for video in results:
-            item = QListWidgetItem(f"{video['title']}\n{video['channel']}")
-            item.setData(Qt.ItemDataRole.UserRole, video)
-            self.youtube_results.addItem(item)
-
-    def show_youtube_error(self, message):
-        self.youtube_results.clear()
-        QMessageBox.warning(self, "YouTube Search Error", message)
-
-    def play_selected_video(self, item):
-        video = item.data(Qt.ItemDataRole.UserRole)
-        if not video:
-            return
-        video_id = video["video_id"]
-        self.current_video_id = video_id
-        title = video["title"]
-        embed_html = f"""<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
-        <style>html,body{{margin:0;padding:0;background:#000;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:0}}</style></head>
-        <body><iframe src='https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&playsinline=1'
-        title='YouTube video player' allow='accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share' allowfullscreen></iframe></body></html>"""
-        self.youtube_player.setHtml(embed_html, QUrl("https://www.youtube-nocookie.com"))
-        self.youtube_title.setText(title)
-        self.youtube_description.setPlainText(video.get("description", ""))
-        self.save_history(self.pending_query or self.youtube_search.text(), title, video_id)
-        self.load_history()
-
-    def save_history(self, query, title, video_id):
-        if not self.current_user_id:
-            return
-        with connect_db() as conn:
-            conn.execute(
-                "INSERT INTO watch_history(user_id, search_query, media_title, video_id) VALUES (?, ?, ?, ?)",
-                (self.current_user_id, query, title, video_id)
-            )
-
-    def load_history(self):
-        if not hasattr(self, "history_table"):
-            return
-        with connect_db() as conn:
-            rows = conn.execute(
-                "SELECT search_query, media_title, datetime(searched_at, 'localtime') FROM watch_history WHERE user_id=? ORDER BY id DESC LIMIT 20",
-                (self.current_user_id,)
-            ).fetchall()
-        self.history_table.setRowCount(0)
-        for row, values in enumerate(rows):
-            self.history_table.insertRow(row)
-            for col, value in enumerate(values):
-                self.history_table.setItem(row, col, QTableWidgetItem(str(value)))
-
-    # ---------------- LOCAL MUSIC PLAYER ----------------
-    def build_music_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        heading = QLabel("LOCAL MUSIC PLAYER")
-        heading.setObjectName("SectionTitle")
-        layout.addWidget(heading)
-        layout.addWidget(QLabel("Add audio files from your computer. Supported formats depend on your system's Qt audio codecs."))
-        add_row = QHBoxLayout()
-        add_btn = QPushButton("Add Music Files")
-        add_btn.setObjectName("Primary")
-        add_btn.clicked.connect(self.add_music_files)
-        remove_btn = QPushButton("Clear Playlist")
-        remove_btn.clicked.connect(self.clear_music_playlist)
-        add_row.addWidget(add_btn)
-        add_row.addWidget(remove_btn)
-        add_row.addStretch()
-        layout.addLayout(add_row)
-        self.music_list = QListWidget()
-        self.music_list.itemDoubleClicked.connect(self.play_music_item)
-        layout.addWidget(self.music_list, 1)
-        self.now_playing = QLabel("Nothing playing")
-        self.now_playing.setObjectName("SectionTitle")
-        layout.addWidget(self.now_playing)
-        controls = QHBoxLayout()
-        for label, callback in [("Play", self.play_music), ("Pause", self.pause_music), ("Stop", self.stop_music)]:
-            btn = QPushButton(label)
-            btn.clicked.connect(callback)
-            controls.addWidget(btn)
-        controls.addStretch()
-        layout.addLayout(controls)
-        self.tabs.addTab(page, "Music Player")
-
-    def add_music_files(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select audio files", "", "Audio Files (*.mp3 *.wav *.ogg *.flac *.m4a);;All Files (*)"
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, password_hash, salt FROM users WHERE username = ?",
+            (username,),
         )
-        for file_path in files:
-            if file_path not in self.music_files:
-                self.music_files.append(file_path)
-                self.music_list.addItem(Path(file_path).name)
+        user = cursor.fetchone()
+        conn.close()
 
-    def clear_music_playlist(self):
-        self.stop_music()
-        self.music_files.clear()
-        self.music_list.clear()
-        self.now_playing.setText("Nothing playing")
+        if user:
+            user_id, stored_hash, salt = user
+            new_hash, _ = hash_password(password, salt)
+            if new_hash == stored_hash:
+                self.current_user_id = user_id
+                self.current_username = username
+                self.user_badge.setText(f"@{username}")
+                self.login_username.clear()
+                self.login_password.clear()
+                self.login_msg.setText("")
 
-    def play_music_item(self, item):
-        index = self.music_list.row(item)
-        if 0 <= index < len(self.music_files):
-            self.music_player.setSource(QUrl.fromLocalFile(self.music_files[index]))
-            self.music_player.play()
-            self.now_playing.setText(Path(self.music_files[index]).name)
+                self.setCurrentIndex(2)
+                self.load_reviews()
+                return
 
-    def play_music(self):
-        if self.music_player.source().isEmpty() and self.music_files:
-            self.play_music_item(self.music_list.item(0))
-        else:
-            self.music_player.play()
+        self.show_msg(self.login_msg, "Invalid username or password.", True)
 
-    def pause_music(self):
-        self.music_player.pause()
+    def show_msg(self, label, text, error=True):
+        label.setText(text)
+        label.setStyleSheet("color: #f87171;" if error else "color: #34d399;")
 
-    def stop_music(self):
-        self.music_player.stop()
+    # --- PAGE 2: MAIN DASHBOARD & MEDIA PLAYER ---
+    def setup_main_ui(self):
+        self.main_screen.setObjectName("MainScreen")
 
-    # ---------------- GUESS THE SONG ----------------
-    def build_game_tab(self):
+        root_layout = QHBoxLayout(self.main_screen)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(18)
+
+        # Premium left navigation
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(218)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(18, 24, 18, 20)
+        sidebar_layout.setSpacing(10)
+
+        brand = QLabel("TRACKBOXD")
+        brand.setObjectName("SidebarBrand")
+        brand_sub = QLabel("YOUR MEDIA JOURNAL")
+        brand_sub.setObjectName("SidebarCaption")
+
+        sidebar_layout.addWidget(brand)
+        sidebar_layout.addWidget(brand_sub)
+        sidebar_layout.addSpacing(28)
+
+        nav_label = QLabel("WORKSPACE")
+        nav_label.setObjectName("SidebarSection")
+        sidebar_layout.addWidget(nav_label)
+
+
+        music_btn = QPushButton("♫   Music & Videos")
+        music_btn.setObjectName("NavButton")
+        music_btn.setProperty("active", False)
+
+        movies_btn = QPushButton("▣   Movies")
+        movies_btn.setObjectName("NavButton")
+        movies_btn.setProperty("active", False)
+
+        games_btn = QPushButton("◇   Games")
+        games_btn.setObjectName("NavButton")
+        games_btn.setProperty("active", False)
+
+        reviews_nav_btn = QPushButton("✎   My Reviews")
+        reviews_nav_btn.setObjectName("NavButton")
+        reviews_nav_btn.setProperty("active", False)
+
+        for button in (music_btn, movies_btn, games_btn, reviews_nav_btn):
+            button.setMinimumHeight(43)
+            sidebar_layout.addWidget(button)
+
+        sidebar_layout.addStretch()
+
+        library_label = QLabel("YOUR SPACE")
+        library_label.setObjectName("SidebarSection")
+        sidebar_layout.addWidget(library_label)
+
+        self.user_badge = QLabel("@guest")
+        self.user_badge.setObjectName("UserPill")
+        self.user_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sidebar_layout.addWidget(self.user_badge)
+
+        logout_btn = QPushButton("↪   Log Out")
+        logout_btn.setObjectName("SidebarLogout")
+        logout_btn.clicked.connect(self.handle_logout)
+        sidebar_layout.addWidget(logout_btn)
+
+        # Main content area
+        content = QWidget()
+        content.setObjectName("ContentArea")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 4, 8, 4)
+        content_layout.setSpacing(18)
+
+        header = QHBoxLayout()
+        header_texts = QVBoxLayout()
+        page_kicker = QLabel("YOUR PERSONAL MEDIA SPACE")
+        page_kicker.setObjectName("SectionKicker")
+        page_title = QLabel("My Reviews")
+        page_title.setObjectName("PageTitle")
+        header_texts.addWidget(page_kicker)
+        header_texts.addWidget(page_title)
+        header.addLayout(header_texts)
+        header.addStretch()
+        content_layout.addLayout(header)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setObjectName("MainScroll")
+
+        scroll_content = QWidget()
+        scroll_content.setObjectName("ScrollContent")
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(2, 2, 10, 18)
+        scroll_layout.setSpacing(18)
+
+        # Featured hero panel
+        hero = QFrame()
+        hero.setObjectName("HeroCard")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(28, 24, 28, 24)
+
+        hero_text = QVBoxLayout()
+        hero_kicker = QLabel("LISTEN • WATCH • DOCUMENT")
+        hero_kicker.setObjectName("HeroKicker")
+        hero_title = QLabel("Your next favorite\nstarts here.")
+        hero_title.setObjectName("HeroTitle")
+        hero_description = QLabel(
+            "Discover music and music videos, then keep a record of what you think."
+        )
+        hero_description.setObjectName("HeroDescription")
+        hero_description.setWordWrap(True)
+
+        explore_btn = QPushButton("Explore music  →")
+        explore_btn.setObjectName("HeroButton")
+        explore_btn.clicked.connect(lambda: self.search_input.setFocus())
+
+        hero_text.addWidget(hero_kicker)
+        hero_text.addSpacing(7)
+        hero_text.addWidget(hero_title)
+        hero_text.addSpacing(5)
+        hero_text.addWidget(hero_description)
+        hero_text.addSpacing(14)
+        hero_text.addWidget(explore_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        hero_layout.addLayout(hero_text, 1)
+
+        hero_side = QLabel("T\nB")
+        hero_side.setObjectName("HeroMonogram")
+        hero_side.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hero_side.setFixedSize(112, 112)
+        hero_layout.addWidget(hero_side, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scroll_layout.addWidget(hero)
+
+        # Player and release details
+        player_card = QFrame()
+        player_card.setObjectName("ProCard")
+        player_layout = QVBoxLayout(player_card)
+        player_layout.setContentsMargins(22, 20, 22, 20)
+        player_layout.setSpacing(13)
+
+        player_header = QHBoxLayout()
+        player_heading = QVBoxLayout()
+        player_kicker = QLabel("NOW PLAYING")
+        player_kicker.setObjectName("SectionKicker")
+        player_title = QLabel("Music & video player")
+        player_title.setObjectName("CardHeader")
+        player_heading.addWidget(player_kicker)
+        player_heading.addWidget(player_title)
+        player_header.addLayout(player_heading)
+        player_header.addStretch()
+
+        self.status_label = QLabel("Ready when you are. Search for a track to begin.")
+        self.status_label.setObjectName("StatusPill")
+        player_header.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        player_layout.addLayout(player_header)
+
+        search_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search a track, artist, or music video...")
+        self.search_input.returnPressed.connect(self.search_youtube_video)
+
+        search_btn = QPushButton("Search & Play")
+        search_btn.setObjectName("PrimaryButton")
+        search_btn.clicked.connect(self.search_youtube_video)
+        search_row.addWidget(self.search_input, 1)
+        search_row.addWidget(search_btn)
+        player_layout.addLayout(search_row)
+
+        media_row = QHBoxLayout()
+        media_row.setSpacing(18)
+
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(280)
+        self.video_widget.setObjectName("VideoSurface")
+
+        self.media_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.setVideoOutput(self.video_widget)
+        self.media_player.mediaStatusChanged.connect(self.handle_media_status)
+
+        release_panel = QFrame()
+        release_panel.setObjectName("ReleasePanel")
+        release_layout = QVBoxLayout(release_panel)
+        release_layout.setContentsMargins(18, 18, 18, 18)
+        release_kicker = QLabel("ABOUT THIS RELEASE")
+        release_kicker.setObjectName("SectionKicker")
+        self.about_text = QLabel(
+            "Release details and description will appear here after you select a video."
+        )
+        self.about_text.setObjectName("SubText")
+        self.about_text.setWordWrap(True)
+        release_layout.addWidget(release_kicker)
+        release_layout.addSpacing(8)
+        release_layout.addWidget(self.about_text)
+        release_layout.addStretch()
+
+        media_row.addWidget(self.video_widget, 2)
+        media_row.addWidget(release_panel, 1)
+        player_layout.addLayout(media_row)
+
+        controls = QHBoxLayout()
+        play_btn = QPushButton("▶  Play")
+        pause_btn = QPushButton("Ⅱ  Pause")
+        stop_btn = QPushButton("■  Stop")
+        for button in (play_btn, pause_btn, stop_btn):
+            button.setObjectName("ControlButton")
+        play_btn.clicked.connect(self.media_player.play)
+        pause_btn.clicked.connect(self.media_player.pause)
+        stop_btn.clicked.connect(self.media_player.stop)
+
+        volume_label = QLabel("VOLUME")
+        volume_label.setObjectName("FieldLabel")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setFixedWidth(125)
+        self.audio_output.setVolume(0.70)
+
+        self.volume_val_label = QLabel("70%")
+        self.volume_val_label.setObjectName("SubText")
+        self.volume_val_label.setFixedWidth(35)
+        self.volume_slider.valueChanged.connect(self.update_volume)
+
+        controls.addWidget(play_btn)
+        controls.addWidget(pause_btn)
+        controls.addWidget(stop_btn)
+        controls.addStretch()
+        controls.addWidget(volume_label)
+        controls.addWidget(self.volume_slider)
+        controls.addWidget(self.volume_val_label)
+        player_layout.addLayout(controls)
+        scroll_layout.addWidget(player_card)
+
+        # Review form and community activity
+        lower_row = QHBoxLayout()
+        lower_row.setSpacing(18)
+
+        log_card = QFrame()
+        log_card.setObjectName("ProCard")
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(22, 20, 22, 20)
+
+        log_title = QLabel("Log & Review")
+        log_title.setObjectName("CardHeader")
+        log_sub = QLabel("Save your rating and thoughts about this release.")
+        log_sub.setObjectName("SubText")
+
+        name_label = QLabel("REVIEWER")
+        name_label.setObjectName("FieldLabel")
+        self.name_display = QLineEdit()
+        self.name_display.setReadOnly(True)
+
+        target_label = QLabel("RELEASE TITLE")
+        target_label.setObjectName("FieldLabel")
+        self.media_title_input = QLineEdit()
+        self.media_title_input.setPlaceholderText("Automatically filled after search...")
+        self.media_title_input.setReadOnly(True)
+
+        rating_label = QLabel("YOUR RATING")
+        rating_label.setObjectName("FieldLabel")
+        self.rating_combo = QComboBox()
+        self.rating_combo.addItem("★☆☆☆☆   1 / 5", 1)
+        self.rating_combo.addItem("★★☆☆☆   2 / 5", 2)
+        self.rating_combo.addItem("★★★☆☆   3 / 5", 3)
+        self.rating_combo.addItem("★★★★☆   4 / 5", 4)
+        self.rating_combo.addItem("★★★★★   5 / 5", 5)
+        self.rating_combo.setCurrentIndex(4)
+
+        review_label = QLabel("YOUR REVIEW")
+        review_label.setObjectName("FieldLabel")
+        self.review_input = QTextEdit()
+        self.review_input.setPlaceholderText("What stood out to you?")
+        self.review_input.setFixedHeight(100)
+
+        submit_btn = QPushButton("Save review")
+        submit_btn.setObjectName("PrimaryButton")
+        submit_btn.clicked.connect(self.save_review)
+
+        log_layout.addWidget(log_title)
+        log_layout.addWidget(log_sub)
+        log_layout.addSpacing(10)
+        log_layout.addWidget(name_label)
+        log_layout.addWidget(self.name_display)
+        log_layout.addWidget(target_label)
+        log_layout.addWidget(self.media_title_input)
+        log_layout.addWidget(rating_label)
+        log_layout.addWidget(self.rating_combo)
+        log_layout.addWidget(review_label)
+        log_layout.addWidget(self.review_input)
+        log_layout.addSpacing(8)
+        log_layout.addWidget(submit_btn)
+
+        reviews_card = QFrame()
+        reviews_card.setObjectName("ProCard")
+        reviews_layout = QVBoxLayout(reviews_card)
+        reviews_layout.setContentsMargins(22, 20, 22, 20)
+
+        reviews_title = QLabel("Community reviews")
+        reviews_title.setObjectName("CardHeader")
+        reviews_sub = QLabel("Recent ratings from the TRACKBOXD community.")
+        reviews_sub.setObjectName("SubText")
+
+        self.reviews_table = QTableWidget(0, 4)
+        self.reviews_table.setHorizontalHeaderLabels(
+            ["USER", "RELEASE", "RATING", "REVIEW"]
+        )
+        self.reviews_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.reviews_table.setMinimumHeight(270)
+        self.reviews_table.setAlternatingRowColors(True)
+
+        reviews_layout.addWidget(reviews_title)
+        reviews_layout.addWidget(reviews_sub)
+        reviews_layout.addSpacing(12)
+        reviews_layout.addWidget(self.reviews_table)
+
+        lower_row.addWidget(log_card, 1)
+        lower_row.addWidget(reviews_card, 1)
+        scroll_layout.addLayout(lower_row)
+
+        scroll_area.setWidget(scroll_content)
+
+        # Separate catalog pages; the existing Discover / Reviews UI stays intact.
+        self.content_stack = QStackedWidget()
+        self.content_stack.addWidget(scroll_area)
+        self.catalog_lists = {}
+        self.catalog_searches = {}
+        self.catalog_status = {}
+        for category in ("Music", "Movies", "Games"):
+            page = self.build_catalog_page(category)
+            self.content_stack.addWidget(page)
+        content_layout.addWidget(self.content_stack)
+        root_layout.addWidget(sidebar)
+        root_layout.addWidget(content, 1)
+
+        self.nav_buttons = {
+            "Music": music_btn,
+            "Movies": movies_btn,
+            "Games": games_btn,
+            "Reviews": reviews_nav_btn,
+        }
+        music_btn.clicked.connect(lambda: self.show_section("Music"))
+        movies_btn.clicked.connect(lambda: self.show_section("Movies"))
+        games_btn.clicked.connect(lambda: self.show_section("Games"))
+        reviews_nav_btn.clicked.connect(lambda: self.show_section("Reviews"))
+        self.show_section("Reviews")
+
+    def build_catalog_page(self, category):
         page = QWidget()
         layout = QVBoxLayout(page)
-        heading = QLabel("GUESS THE SONG")
-        heading.setObjectName("SectionTitle")
-        intro = QLabel("Listen to a short music clip, then choose the correct song from four answers.")
-        intro.setObjectName("Muted")
-        layout.addWidget(heading)
+        layout.setContentsMargins(8, 8, 10, 12)
+        layout.setSpacing(16)
+
+        intro = QFrame()
+        intro.setObjectName("HeroCard")
+        intro_layout = QVBoxLayout(intro)
+        intro_layout.setContentsMargins(24, 20, 24, 20)
+        kicker = QLabel("TRACKBOXD DISCOVERY")
+        kicker.setObjectName("HeroKicker")
+        heading = QLabel({"Music": "Find your next favorite sound", "Movies": "Find your next movie night", "Games": "Find your next game"}[category])
+        heading.setObjectName("HeroTitle")
+        description = QLabel({
+            "Music": "Browse song recommendations and play available previews.",
+            "Movies": "Search movie titles and browse available movie details from the Apple iTunes catalog.",
+            "Games": "Discover games from the catalog and play selected arcade games directly inside TRACKBOXD."
+        }[category])
+        description.setObjectName("HeroDescription")
+        description.setWordWrap(True)
+        intro_layout.addWidget(kicker)
+        intro_layout.addWidget(heading)
+        intro_layout.addWidget(description)
         layout.addWidget(intro)
 
-        library_row = QHBoxLayout()
-        add_song_btn = QPushButton("Add Quiz Song")
-        add_song_btn.setObjectName("Primary")
-        add_song_btn.clicked.connect(self.add_quiz_song)
-        library_row.addWidget(add_song_btn)
-        self.song_count_label = QLabel("0 songs in quiz library")
-        self.song_count_label.setObjectName("Muted")
-        library_row.addWidget(self.song_count_label)
-        library_row.addStretch()
-        layout.addLayout(library_row)
+        search_row = QHBoxLayout()
+        search = QLineEdit()
+        search.setPlaceholderText(f"Search {category.lower()}...")
+        search_button = QPushButton(f"Search {category}")
+        search_button.setObjectName("PrimaryButton")
+        search_row.addWidget(search, 1)
+        search_row.addWidget(search_button)
+        layout.addLayout(search_row)
 
-        settings_row = QHBoxLayout()
-        settings_row.addWidget(QLabel("Clip length:"))
-        self.clip_length = QComboBox()
-        self.clip_length.addItem("3 seconds", 3)
-        self.clip_length.addItem("5 seconds", 5)
-        self.clip_length.addItem("10 seconds", 10)
-        settings_row.addWidget(self.clip_length)
-        settings_row.addWidget(QLabel("Questions:"))
-        self.question_count = QComboBox()
-        self.question_count.addItem("5", 5)
-        self.question_count.addItem("10", 10)
-        self.question_count.addItem("15", 15)
-        self.question_count.setCurrentIndex(1)
-        settings_row.addWidget(self.question_count)
-        settings_row.addStretch()
-        layout.addLayout(settings_row)
+        # Shared playback controls are also available directly on the Music page.
+        # They control the same QMediaPlayer used by the video player on Discover.
+        if category == "Music":
+            playback_card = QFrame()
+            playback_card.setObjectName("ProCard")
+            playback_layout = QHBoxLayout(playback_card)
+            playback_layout.setContentsMargins(18, 12, 18, 12)
+            playback_layout.setSpacing(10)
 
-        self.game_status = QLabel("Add at least four quiz songs to start playing.")
-        self.game_status.setObjectName("GameStatus")
-        self.game_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.game_status)
-        self.game_score_label = QLabel("Score: 0 / 0")
-        self.game_score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.game_score_label)
-        self.game_progress = QLabel("Ready when you are")
-        self.game_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.game_progress.setObjectName("Muted")
-        layout.addWidget(self.game_progress)
+            playback_label = QLabel("MUSIC PLAYER")
+            playback_label.setObjectName("SectionKicker")
+            playback_layout.addWidget(playback_label)
 
-        self.answer_buttons = []
-        for index in range(4):
-            button = QPushButton(f"Option {index + 1}")
-            button.setMinimumHeight(48)
-            button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, i=index: self.check_answer(i))
-            self.answer_buttons.append(button)
-            layout.addWidget(button)
+            music_play_btn = QPushButton("▶  Play")
+            music_pause_btn = QPushButton("Ⅱ  Pause")
+            music_stop_btn = QPushButton("■  Stop")
+            for control in (music_play_btn, music_pause_btn, music_stop_btn):
+                control.setObjectName("ControlButton")
+                control.setMinimumHeight(36)
+            music_play_btn.clicked.connect(self.media_player.play)
+            music_pause_btn.clicked.connect(self.media_player.pause)
+            music_stop_btn.clicked.connect(self.media_player.stop)
+            playback_layout.addWidget(music_play_btn)
+            playback_layout.addWidget(music_pause_btn)
+            playback_layout.addWidget(music_stop_btn)
+            playback_layout.addStretch()
 
-        self.game_feedback = QLabel("")
-        self.game_feedback.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.game_feedback)
-        game_controls = QHBoxLayout()
-        self.start_game_btn = QPushButton("Start Game")
-        self.start_game_btn.setObjectName("Primary")
-        self.start_game_btn.clicked.connect(self.start_game)
-        self.next_question_btn = QPushButton("Next Question")
-        self.next_question_btn.setEnabled(False)
-        self.next_question_btn.clicked.connect(self.next_question)
-        game_controls.addWidget(self.start_game_btn)
-        game_controls.addWidget(self.next_question_btn)
-        game_controls.addStretch()
-        layout.addLayout(game_controls)
+            music_volume_label = QLabel("VOLUME")
+            music_volume_label.setObjectName("FieldLabel")
+            playback_layout.addWidget(music_volume_label)
 
-        layout.addWidget(QLabel("YOUR RECENT GAME SCORES"))
-        self.scores_table = QTableWidget(0, 3)
-        self.scores_table.setHorizontalHeaderLabels(["Score", "Questions", "Played at"])
-        self.scores_table.horizontalHeader().setStretchLastSection(True)
-        self.scores_table.setMaximumHeight(170)
-        layout.addWidget(self.scores_table)
-        layout.addStretch()
-        self.tabs.addTab(page, "Guess the Song")
+            self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
+            self.music_volume_slider.setRange(0, 100)
+            self.music_volume_slider.setValue(70)
+            self.music_volume_slider.setFixedWidth(125)
+            self.music_volume_slider.valueChanged.connect(self.update_volume)
+            playback_layout.addWidget(self.music_volume_slider)
 
-    def add_quiz_song(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Choose a song clip", "", "Audio Files (*.mp3 *.wav *.ogg *.flac *.m4a);;All Files (*)"
-        )
-        if not file_path:
-            return
-        title, ok = QInputDialog.getText(self, "Song title", "Enter the song title:")
-        if not ok or not title.strip():
-            return
-        artist, ok = QInputDialog.getText(self, "Artist", "Enter the artist name:")
-        if not ok:
-            return
-        try:
-            with connect_db() as conn:
-                conn.execute(
-                    "INSERT INTO quiz_songs(title, artist, file_path) VALUES (?, ?, ?)",
-                    (title.strip(), artist.strip() or "Unknown artist", file_path)
-                )
-            self.load_quiz_songs()
-            QMessageBox.information(self, "Song added", "The song has been added to your quiz library.")
-        except sqlite3.IntegrityError:
-            QMessageBox.warning(self, "Already added", "This audio file is already in your quiz library.")
+            self.music_volume_value = QLabel("70%")
+            self.music_volume_value.setObjectName("SubText")
+            self.music_volume_value.setFixedWidth(38)
+            playback_layout.addWidget(self.music_volume_value)
+            layout.addWidget(playback_card)
 
-    def load_quiz_songs(self):
-        with connect_db() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM quiz_songs").fetchone()[0]
-        if hasattr(self, "song_count_label"):
-            self.song_count_label.setText(f"{count} songs in quiz library")
-        self.load_game_scores()
+        status = QLabel("Loading recommendations...")
+        status.setObjectName("SubText")
+        layout.addWidget(status)
+        results = QListWidget()
+        results.setObjectName("CatalogResults")
+        results.setSpacing(6)
+        layout.addWidget(results, 1)
 
-    def start_game(self):
-        with connect_db() as conn:
-            songs = conn.execute("SELECT id, title, artist, file_path FROM quiz_songs").fetchall()
-        songs = [song for song in songs if os.path.isfile(song[3])]
-        if len(songs) < 4:
-            QMessageBox.warning(self, "Not enough songs", "Add at least four valid audio files to the quiz library first.")
-            return
-        self.quiz_total = self.question_count.currentData()
-        self.quiz_questions = random.sample(songs, min(len(songs), self.quiz_total))
-        self.quiz_total = len(self.quiz_questions)
-        self.quiz_index = 0
-        self.quiz_score = 0
-        self.game_score_label.setText(f"Score: 0 / {self.quiz_total}")
-        self.start_game_btn.setEnabled(False)
-        self.show_question()
 
-    def show_question(self):
-        self.clip_timer.stop()
-        self.game_player.stop()
-        if self.quiz_index >= self.quiz_total:
-            self.finish_game()
-            return
-        song = self.quiz_questions[self.quiz_index]
-        other_songs = [s for s in self.quiz_questions if s[0] != song[0]]
-        # Add distractors from the full library if the selected game has fewer than four songs.
-        with connect_db() as conn:
-            all_songs = conn.execute("SELECT id, title, artist, file_path FROM quiz_songs").fetchall()
-        distractors = [s for s in all_songs if s[0] != song[0] and s[0] not in {x[0] for x in other_songs}]
-        choices = [song] + random.sample(other_songs + distractors, 3)
-        random.shuffle(choices)
-        self.current_question = {"song": song, "choices": choices}
-        self.answer_locked = False
-        self.game_feedback.setText("")
-        self.game_progress.setText(f"Question {self.quiz_index + 1} of {self.quiz_total}")
-        self.game_status.setText(f"Listen to the {self.clip_length.currentData()}-second clip...")
-        for index, button in enumerate(self.answer_buttons):
-            button.setText(f"{chr(65 + index)}. {choices[index][1]} — {choices[index][2]}")
-            button.setEnabled(False)
-            button.setStyleSheet("")
-        self.quiz_clip_duration_ms = int(self.clip_length.currentData()) * 1000
-        self.waiting_for_quiz_clip = True
-        self.game_player.setSource(QUrl.fromLocalFile(song[3]))
-        self.game_player.play()
+        # Embedded arcade games
+        if category == "Games":
+            arcade_card = QFrame()
+            arcade_card.setObjectName("ProCard")
 
-    def handle_quiz_media_status(self, status):
-        if self.waiting_for_quiz_clip and status in (
-            QMediaPlayer.MediaStatus.LoadedMedia,
-            QMediaPlayer.MediaStatus.BufferedMedia,
-        ):
-            self.waiting_for_quiz_clip = False
-            self.clip_timer.start(self.quiz_clip_duration_ms)
+            arcade_layout = QVBoxLayout(arcade_card)
+            arcade_layout.setContentsMargins(18, 16, 18, 16)
+            arcade_layout.setSpacing(10)
 
-    def stop_quiz_clip(self):
-        self.game_player.stop()
-        self.game_status.setText("Clip finished! Choose the correct song.")
-        for button in self.answer_buttons:
-            button.setEnabled(True)
+            arcade_title = QLabel("TRACKBOXD ARCADE")
+            arcade_title.setObjectName("SectionKicker")
 
-    def check_answer(self, choice_index):
-        if self.answer_locked or not self.current_question:
-            return
-        self.answer_locked = True
-        correct_song = self.current_question["song"]
-        selected_song = self.current_question["choices"][choice_index]
-        if selected_song[0] == correct_song[0]:
-            self.quiz_score += 1
-            self.game_feedback.setText("Correct! Nice work.")
-            self.game_feedback.setStyleSheet("color:#34d399;font-weight:700")
-        else:
-            self.game_feedback.setText(f"Not quite. Correct answer: {correct_song[1]} — {correct_song[2]}")
-            self.game_feedback.setStyleSheet("color:#f87171;font-weight:700")
-        self.game_score_label.setText(f"Score: {self.quiz_score} / {self.quiz_total}")
-        for button in self.answer_buttons:
-            button.setEnabled(False)
-        self.next_question_btn.setEnabled(True)
-
-    def next_question(self):
-        self.next_question_btn.setEnabled(False)
-        self.quiz_index += 1
-        self.show_question()
-
-    def finish_game(self):
-        self.game_player.stop()
-        self.game_status.setText("Game completed!")
-        self.game_progress.setText(f"Final result: {self.quiz_score} out of {self.quiz_total}")
-        self.game_feedback.setText("Great job! Start another game whenever you're ready.")
-        self.start_game_btn.setEnabled(True)
-        self.next_question_btn.setEnabled(False)
-        for button in self.answer_buttons:
-            button.setEnabled(False)
-        with connect_db() as conn:
-            conn.execute(
-                "INSERT INTO game_scores(user_id, score, total_questions) VALUES (?, ?, ?)",
-                (self.current_user_id, self.quiz_score, self.quiz_total)
+            arcade_description = QLabel(
+                "Play classic arcade games without leaving TRACKBOXD."
             )
-        self.load_game_scores()
+            arcade_description.setObjectName("SubText")
 
-    def load_game_scores(self):
-        if not hasattr(self, "scores_table") or not self.current_user_id:
+            snake_button = QPushButton("▶  Play Snake")
+            snake_button.setObjectName("PrimaryButton")
+            snake_button.setMinimumHeight(42)
+            snake_button.clicked.connect(self.open_snake_game)
+
+            tictactoe_button = QPushButton("▶  Play Tic-Tac-Toe")
+            tictactoe_button.setObjectName("PrimaryButton")
+            tictactoe_button.setMinimumHeight(42)
+            tictactoe_button.clicked.connect(self.open_tictactoe_game)
+
+            arcade_layout.addWidget(arcade_title)
+            arcade_layout.addWidget(arcade_description)
+            arcade_layout.addWidget(snake_button)
+            arcade_layout.addWidget(tictactoe_button)
+
+            layout.addWidget(arcade_card)
+
+        self.catalog_lists[category] = results
+        self.catalog_searches[category] = search
+        self.catalog_status[category] = status
+        search_button.clicked.connect(lambda checked=False, c=category: self.fetch_catalog(c, self.catalog_searches[c].text().strip()))
+        search.returnPressed.connect(lambda c=category: self.fetch_catalog(c, self.catalog_searches[c].text().strip()))
+        results.itemDoubleClicked.connect(lambda item, c=category: self.open_catalog_item(c, item))
+        return page
+
+    def show_section(self, section):
+        indexes = {
+            "Music": 1,
+            "Movies": 2,
+            "Games": 3,
+            "Reviews": 0
+        }
+
+        self.content_stack.setCurrentIndex(indexes[section])
+
+        for name, button in self.nav_buttons.items():
+            button.setProperty("active", name == section)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+        if section == "Reviews":
+            self.review_input.setFocus()
+
+        elif section in ("Music", "Movies", "Games"):
+            listing = self.catalog_lists[section]
+
+            if listing.count() == 0:
+                defaults = {
+                    "Music": "top hits",
+                    "Movies": "Interstellar",
+                    "Games": "Minecraft"
+                }
+                self.fetch_catalog(section, defaults[section])
+
+    def fetch_catalog(self, category, query):
+        if not query:
+            query = {"Music": "top hits", "Movies": "Interstellar", "Games": "Minecraft"}[category]
+        self.catalog_status[category].setText(f"Finding {category.lower()} recommendations...")
+        self.catalog_lists[category].clear()
+        self.catalog_thread = CatalogFetchThread(category, query)
+        self.catalog_thread.results_signal.connect(self.show_catalog_results)
+        self.catalog_thread.error_signal.connect(self.show_catalog_error)
+        self.catalog_thread.start()
+
+    def show_catalog_results(self, category, results):
+        listing = self.catalog_lists[category]
+        listing.clear()
+        if not results:
+            if category == "Movies":
+                self.catalog_status[category].setText("No movie results found. Try an exact title such as Interstellar.")
+            elif category == "Games":
+                self.catalog_status[category].setText("No games found. Try Minecraft, Dota 2, or Portal 2. Check your internet connection.")
+            else:
+                self.catalog_status[category].setText("No results found. Try another search.")
             return
-        with connect_db() as conn:
-            rows = conn.execute(
-                "SELECT score, total_questions, datetime(played_at, 'localtime') FROM game_scores WHERE user_id=? ORDER BY id DESC LIMIT 10",
-                (self.current_user_id,)
-            ).fetchall()
-        self.scores_table.setRowCount(0)
-        for row, values in enumerate(rows):
-            self.scores_table.insertRow(row)
-            for col, value in enumerate(values):
-                self.scores_table.setItem(row, col, QTableWidgetItem(str(value)))
+        for result in results:
+            if category == "Music":
+                title = result.get("trackName", "Unknown track")
+                creator = result.get("artistName", "Unknown artist")
+                detail = result.get("collectionName", "Single")
 
-    # ---------------- REVIEWS / COMMUNITY ----------------
-    def build_community_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        title = QLabel("COMMUNITY REVIEWS")
-        title.setObjectName("SectionTitle")
-        layout.addWidget(title)
-        form = QFormLayout()
-        self.review_title = QLineEdit()
-        self.review_title.setPlaceholderText("Song or video title")
-        self.review_rating = QComboBox()
-        for value in range(1, 6):
-            self.review_rating.addItem("★" * value, value)
-        self.review_rating.setCurrentIndex(4)
-        self.review_comment = QTextEdit()
-        self.review_comment.setPlaceholderText("Write your review...")
-        self.review_comment.setMaximumHeight(100)
-        form.addRow("Media title", self.review_title)
-        form.addRow("Rating", self.review_rating)
-        form.addRow("Review", self.review_comment)
-        layout.addLayout(form)
-        save_btn = QPushButton("Save Review")
-        save_btn.setObjectName("Primary")
-        save_btn.clicked.connect(self.save_review)
-        layout.addWidget(save_btn)
-        self.reviews_table = QTableWidget(0, 4)
-        self.reviews_table.setHorizontalHeaderLabels(["User", "Media", "Rating", "Review"])
-        self.reviews_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.reviews_table, 1)
-        self.tabs.addTab(page, "Reviews")
+            elif category == "Movies":
+                snippet = result.get("snippet", {})
+                title = snippet.get("title", "Unknown video")
+                creator = snippet.get("channelTitle", "YouTube")
+                detail = "YouTube Video"
+
+            else:
+                title = result.get("name", "Unknown game")
+                creator = "Steam game"
+                detail = "Open game details"
+
+            item = QListWidgetItem(f"  {title}   ·   {creator}   ·   {detail}")
+            item.setData(Qt.ItemDataRole.UserRole, result)
+            listing.addItem(item)
+
+        self.catalog_status[category].setText(
+            f"Showing {len(results)} recommendations/results. Double-click an item to open or play it."
+        )
+
+    def show_catalog_error(self, category, message):
+        self.catalog_status[category].setText(f"Could not load {category.lower()}: {message}")
+
+    def open_catalog_item(self, category, item):
+        result = item.data(Qt.ItemDataRole.UserRole) or {}
+
+        if category == "Music":
+            preview = result.get("previewUrl")
+
+            if preview:
+                self.media_player.setSource(QUrl(preview))
+                self.media_player.play()
+                self.media_title_input.setText(result.get("trackName", ""))
+                self.status_label.setText(
+                    f"Preview: {result.get('trackName', 'Selected track')}"
+                )
+                self.about_text.setText(
+                    f"{result.get('artistName', '')}\n"
+                    f"{result.get('collectionName', '')}\n"
+                    "Preview provided by Apple/iTunes."
+                )
+            else:
+                link = result.get("trackViewUrl")
+                if link:
+                    QDesktopServices.openUrl(QUrl(link))
+
+        elif category == "Movies":
+            video_id = result.get("id", {}).get("videoId")
+
+            if not video_id:
+                QMessageBox.information(
+                    self,
+                    "Playback Error",
+                    "YouTube video ID is not available."
+                )
+                return
+
+            if not hasattr(self, "youtube_player_page"):
+                self.youtube_player_page = QWidget()
+                player_layout = QVBoxLayout(self.youtube_player_page)
+
+                back_button = QPushButton("← Back to Movies")
+                back_button.clicked.connect(
+                    lambda: self.content_stack.setCurrentIndex(2)
+                )
+
+                self.youtube_player_view = QWebEngineView()
+
+                player_layout.addWidget(back_button)
+                player_layout.addWidget(self.youtube_player_view)
+
+                self.content_stack.addWidget(self.youtube_player_page)
+
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta name="referrer" content="strict-origin-when-cross-origin">
+                <style>
+                    html, body {{
+                        margin: 0;
+                        width: 100%;
+                        height: 100%;
+                        background: #111827;
+                    }}
+                    iframe {{
+                        width: 100%;
+                        height: 100%;
+                        border: none;
+                    }}
+                </style>
+            </head>
+            <body>
+                <iframe
+                    src="https://www.youtube.com/embed/{video_id}"
+                    referrerpolicy="strict-origin-when-cross-origin"
+                    allow="autoplay; encrypted-media; picture-in-picture"
+                    allowfullscreen>
+                </iframe>
+            </body>
+            </html>
+            """
+
+            self.youtube_player_view.setHtml(
+                html,
+                QUrl("https://trackboxd.app/")
+            )
+            self.content_stack.setCurrentWidget(self.youtube_player_page)
+
+        else:
+            app_id = result.get("id")
+            if app_id:
+                QDesktopServices.openUrl(
+                    QUrl(f"https://store.steampowered.com/app/{app_id}/")
+                )
+
+    # --- MEDIA STATUS HANDLER (PREVENTS LOOPING) ---
+    def handle_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.media_player.stop()  # Stop cleanly at end without looping
+
+    def update_volume(self, value):
+        self.audio_output.setVolume(value / 100.0)
+        if hasattr(self, "volume_val_label"):
+            self.volume_val_label.setText(f"{value}%")
+        if hasattr(self, "music_volume_value"):
+            self.music_volume_value.setText(f"{value}%")
+        # Keep both volume sliders synchronized because they control one player.
+        for slider_name in ("volume_slider", "music_volume_slider"):
+            slider = getattr(self, slider_name, None)
+            if slider is not None and slider.value() != value:
+                slider.blockSignals(True)
+                slider.setValue(value)
+                slider.blockSignals(False)
+
+    def search_youtube_video(self):
+        query = self.search_input.text().strip()
+        if not query:
+            QMessageBox.warning(
+                self, "Warning", "Please enter a title to search."
+            )
+            return
+
+        self.status_label.setText(
+            "Fetching stream and release details..."
+        )
+        self.status_label.setStyleSheet("color: #10b981;")
+
+        self.fetch_thread = YTFetchThread(query)
+        self.fetch_thread.finished_signal.connect(self.on_yt_fetch_success)
+        self.fetch_thread.error_signal.connect(self.on_yt_fetch_error)
+        self.fetch_thread.start()
+
+    def on_yt_fetch_success(self, stream_url, title, description):
+        self.status_label.setText(f"Playing: {title}")
+        self.status_label.setStyleSheet("color: #10b981;")
+
+        self.media_title_input.setText(title)
+        self.about_text.setText(description)
+
+        self.media_player.setSource(QUrl(stream_url))
+        self.media_player.play()
+
+    def on_yt_fetch_error(self, err_msg):
+        self.status_label.setText("Search failed.")
+        self.status_label.setStyleSheet("color: #f87171;")
+        QMessageBox.warning(self, "Search Error", f"Error details:\n{err_msg}")
 
     def save_review(self):
-        title = self.review_title.text().strip()
-        comment = self.review_comment.toPlainText().strip()
-        if not title or not comment:
-            QMessageBox.warning(self, "Missing information", "Enter a media title and review.")
-            return
-        with connect_db() as conn:
-            conn.execute(
-                "INSERT INTO reviews(user_id, media_title, rating, comment) VALUES (?, ?, ?, ?)",
-                (self.current_user_id, title, self.review_rating.currentData(), comment)
+        media_title = self.media_title_input.text().strip()
+        comment = self.review_input.toPlainText().strip()
+        rating = self.rating_combo.currentData()
+
+        if not media_title:
+            QMessageBox.warning(
+                self,
+                "Warning",
+                "Please search for a music video first to log a review.",
             )
-        self.review_title.clear()
-        self.review_comment.clear()
+            return
+
+        if not comment:
+            QMessageBox.warning(
+                self, "Warning", "Please write your review comment."
+            )
+            return
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO reviews (user_id, media_title, rating, comment) VALUES (?, ?, ?, ?)",
+            (self.current_user_id, media_title, rating, comment),
+        )
+        conn.commit()
+        conn.close()
+
+        self.review_input.clear()
         self.load_reviews()
 
     def load_reviews(self):
-        if not hasattr(self, "reviews_table"):
-            return
-        with connect_db() as conn:
-            rows = conn.execute(
-                "SELECT users.username, reviews.media_title, reviews.rating, reviews.comment FROM reviews JOIN users ON users.id=reviews.user_id ORDER BY reviews.id DESC LIMIT 100"
-            ).fetchall()
+        self.name_display.setText(self.current_username)
         self.reviews_table.setRowCount(0)
-        for row, values in enumerate(rows):
-            self.reviews_table.insertRow(row)
-            for col, value in enumerate(values):
-                display = "★" * value if col == 2 else str(value)
-                self.reviews_table.setItem(row, col, QTableWidgetItem(display))
 
-    # ---------------- LOGOUT / STYLING ----------------
-    def logout(self):
-        self.clip_timer.stop()
-        self.music_player.stop()
-        self.game_player.stop()
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT users.username, reviews.media_title, reviews.rating, reviews.comment 
+            FROM reviews 
+            JOIN users ON reviews.user_id = users.id
+            ORDER BY reviews.id DESC
+        """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        for row_idx, row_data in enumerate(rows):
+            self.reviews_table.insertRow(row_idx)
+            for col_idx, cell_data in enumerate(row_data):
+                val = "★" * cell_data if col_idx == 2 else str(cell_data)
+                self.reviews_table.setItem(
+                    row_idx, col_idx, QTableWidgetItem(val)
+                )
+
+    def handle_logout(self):
+        self.media_player.stop()
         self.current_user_id = None
         self.current_username = ""
-        self.stack.setCurrentIndex(0)
+        self.setCurrentIndex(0)
 
-    def apply_styles(self):
-        self.setStyleSheet("""
-            QWidget { background:#090d16; color:#e2e8f0; font-family:'Segoe UI'; font-size:13px; }
-            QFrame#AuthCard { background:#0f172a; border:1px solid #263449; border-radius:16px; }
-            QLabel#AuthLogo { color:#ffffff; font-size:25px; font-weight:900; letter-spacing:3px; padding:8px; }
-            QLabel#Brand { color:#ffffff; font-size:21px; font-weight:900; letter-spacing:2px; }
-            QLabel#UserBadge { color:#34d399; background:#10251f; border:1px solid #1e4939; border-radius:10px; padding:7px 12px; }
-            QLabel#Muted { color:#94a3b8; }
-            QLabel#SectionTitle { color:#ffffff; font-size:18px; font-weight:700; padding:5px 0; }
-            QLabel#GameStatus { color:#ffffff; background:#111c30; border:1px solid #263449; border-radius:12px; padding:20px; font-size:18px; font-weight:700; }
-            QLineEdit, QTextEdit, QComboBox, QListWidget, QTableWidget { background:#0b1220; color:#e2e8f0; border:1px solid #263449; border-radius:8px; padding:8px; selection-background-color:#1d4ed8; }
-            QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border:1px solid #3b82f6; }
-            QPushButton { background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:10px 15px; font-weight:600; }
-            QPushButton:hover { background:#334155; }
-            QPushButton:disabled { color:#64748b; background:#111827; }
-            QPushButton#Primary { background:#2563eb; border:1px solid #2563eb; color:white; }
-            QPushButton#Primary:hover { background:#1d4ed8; }
-            QPushButton#LinkButton { background:transparent; border:none; color:#60a5fa; }
-            QTabWidget::pane { border:1px solid #263449; border-radius:10px; padding:8px; }
-            QTabBar::tab { background:#111827; color:#94a3b8; padding:11px 18px; margin-right:4px; border-radius:7px; }
-            QTabBar::tab:selected { background:#1d4ed8; color:white; }
-            QHeaderView::section { background:#172033; color:#cbd5e1; border:none; padding:7px; }
-        """)
-
-
-def main():
-    init_db()
-    app = QApplication(sys.argv)
-    window = TrackboxdApp()
-    window.show()
-    sys.exit(app.exec())
+    # --- TRACKBOXD SLATE & SILVER DESIGN SYSTEM ---
+    def apply_professional_stylesheet(self):
+        self.setStyleSheet(
+            """
+            QStackedWidget, QWidget#MainScreen {
+                background-color: #111820;
+            }
+            QWidget {
+                color: #E5EAF0;
+                font-family: "Segoe UI", Arial, sans-serif;
+                font-size: 13px;
+            }
+            QWidget#ContentArea, QWidget#ScrollContent {
+                background: transparent;
+            }
+            QFrame#Sidebar {
+                background-color: #19232E;
+                border: 1px solid #2C3947;
+                border-radius: 20px;
+            }
+            #SidebarBrand {
+                color: #F2F5F8;
+                font-size: 21px;
+                font-weight: 900;
+                letter-spacing: 2px;
+                background: transparent;
+            }
+            #SidebarCaption, #SidebarSection {
+                color: #8291A1;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1.5px;
+                background: transparent;
+            }
+            #SidebarSection { margin-top: 8px; }
+            QPushButton#NavButton {
+                text-align: left;
+                color: #AEBAC7;
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 10px;
+                padding: 11px 12px;
+                font-weight: 600;
+            }
+            QPushButton#NavButton:hover {
+                color: #F4F6F8;
+                background-color: #263442;
+                border-color: #354657;
+            }
+            QPushButton#NavButton[active="true"] {
+                color: #F5F7FA;
+                background-color: #304357;
+                border: 1px solid #52677C;
+            }
+            QPushButton#SidebarLogout {
+                color: #D5DDE5;
+                background-color: #222F3C;
+                border: 1px solid #3A4A5A;
+                border-radius: 10px;
+                padding: 10px;
+                text-align: left;
+            }
+            QPushButton#SidebarLogout:hover {
+                background-color: #304052;
+                border-color: #718397;
+            }
+            #UserPill {
+                color: #E2E8EF;
+                background-color: #253342;
+                border: 1px solid #405164;
+                border-radius: 10px;
+                padding: 9px;
+                font-weight: 600;
+            }
+            #PageTitle {
+                color: #F2F5F8;
+                font-size: 27px;
+                font-weight: 750;
+                background: transparent;
+            }
+            #SectionKicker, #HeroKicker {
+                color: #91A3B5;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1.6px;
+                background: transparent;
+            }
+            QFrame#HeroCard {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #35495D, stop: 0.55 #293B4D, stop: 1 #202D3A
+                );
+                border: 1px solid #526579;
+                border-top: 1px solid #718397;
+                border-radius: 18px;
+            }
+            #HeroTitle {
+                color: #FFFFFF;
+                font-size: 29px;
+                font-weight: 800;
+                background: transparent;
+            }
+            #HeroDescription {
+                color: #C3CDD7;
+                font-size: 13px;
+                background: transparent;
+            }
+            #HeroMonogram {
+                color: rgba(238, 243, 248, 175);
+                background-color: rgba(220, 230, 240, 22);
+                border: 1px solid rgba(230, 238, 246, 75);
+                border-radius: 56px;
+                font-size: 34px;
+                font-weight: 800;
+            }
+            QFrame#ProCard, QFrame#AuthCard {
+                background-color: #1B2631;
+                border: 1px solid #344250;
+                border-top: 1px solid #566777;
+                border-radius: 16px;
+            }
+            #BrandLogoAuth {
+                color: #F2F5F8;
+                font-size: 27px;
+                font-weight: 900;
+                letter-spacing: 3px;
+                background: transparent;
+            }
+            #BrandSubAuth {
+                color: #AAB7C4;
+                font-size: 12px;
+                background: transparent;
+            }
+            QPushButton#PrimaryLogBtn {
+                color: #F7F9FB;
+                background-color: #536B82;
+                border: 1px solid #8295A8;
+                border-top: 1px solid #AAB8C5;
+                border-radius: 10px;
+                padding: 11px 18px;
+                font-weight: 750;
+            }
+            QPushButton#PrimaryLogBtn:hover {
+                background-color: #647E96;
+                border-color: #C0CBD5;
+            }
+            QPushButton#SecondaryBtn {
+                color: #C9D3DC;
+                background-color: #222F3B;
+                border: 1px solid #3D4D5C;
+                border-radius: 9px;
+                padding: 10px 14px;
+            }
+            QPushButton#SecondaryBtn:hover {
+                color: #FFFFFF;
+                background-color: #354657;
+                border-color: #718397;
+            }
+            QFrame#ReleasePanel {
+                background-color: #202C38;
+                border: 1px solid #3A4A59;
+                border-radius: 12px;
+            }
+            #CardHeader {
+                color: #F0F3F6;
+                font-size: 18px;
+                font-weight: 700;
+                background: transparent;
+            }
+            #SubText {
+                color: #AAB6C2;
+                font-size: 12px;
+                background: transparent;
+            }
+            #StatusPill {
+                color: #C5D0DA;
+                background-color: #263543;
+                border: 1px solid #405365;
+                border-radius: 10px;
+                padding: 7px 10px;
+                font-size: 11px;
+            }
+            #FieldLabel {
+                color: #9EADBB;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1px;
+                background: transparent;
+            }
+            QLineEdit, QTextEdit, QComboBox {
+                color: #E9EEF3;
+                background-color: #121B24;
+                border: 1px solid #3A4958;
+                border-radius: 9px;
+                padding: 10px 12px;
+                selection-background-color: #526A82;
+            }
+            QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
+                border: 1px solid #8A9BAC;
+                background-color: #17232E;
+            }
+            QLineEdit:read-only {
+                color: #AEBAC6;
+                background-color: #19242E;
+            }
+            QLineEdit::placeholder, QTextEdit::placeholder {
+                color: #718091;
+            }
+            QPushButton {
+                color: #E8EDF2;
+                background-color: #2A3947;
+                border: 1px solid #4B5D6F;
+                border-top: 1px solid #718397;
+                border-radius: 9px;
+                padding: 10px 15px;
+                font-weight: 650;
+            }
+            QPushButton:hover {
+                background-color: #394C5E;
+                border-color: #8A9BAC;
+            }
+            QPushButton:pressed {
+                background-color: #202D39;
+            }
+            QPushButton#PrimaryButton, QPushButton#HeroButton {
+                color: #F7F9FB;
+                background-color: #536B82;
+                border: 1px solid #8295A8;
+                border-top: 1px solid #AAB8C5;
+                border-radius: 10px;
+                padding: 11px 18px;
+                font-weight: 750;
+            }
+            QPushButton#PrimaryButton:hover, QPushButton#HeroButton:hover {
+                background-color: #647E96;
+                border-color: #C0CBD5;
+            }
+            QPushButton#ControlButton {
+                color: #C9D2DB;
+                background-color: #222F3B;
+                border: 1px solid #3D4D5C;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton#ControlButton:hover {
+                color: #FFFFFF;
+                background-color: #354657;
+                border-color: #718397;
+            }
+            QVideoWidget {
+                background-color: #080D12;
+                border: 1px solid #465564;
+                border-radius: 12px;
+            }
+            QScrollArea, QScrollArea QWidget#qt_scrollarea_viewport {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #17212B;
+                width: 9px;
+                margin: 2px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #586A7C;
+                border-radius: 4px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #8293A3;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: #101820;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #8295A8;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #E6EBF0;
+                border: 1px solid #9AA9B7;
+                width: 13px;
+                height: 13px;
+                margin: -5px 0;
+                border-radius: 6px;
+            }
+            QTableWidget {
+                color: #DCE3E9;
+                background-color: #151F29;
+                alternate-background-color: #1D2934;
+                gridline-color: #2E3B48;
+                border: 1px solid #394957;
+                border-radius: 10px;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border: none;
+            }
+            QHeaderView::section {
+                color: #B9C4CE;
+                background-color: #263442;
+                border: none;
+                border-bottom: 1px solid #465665;
+                padding: 10px 8px;
+                font-size: 10px;
+                font-weight: 800;
+            }
+            """
+        )
 
 
 if __name__ == "__main__":
-    main()
+    print("STEP 1: Starting database")
+    init_db()
+
+    print("STEP 2: Starting application")
+    app = QApplication(sys.argv)
+
+    print("STEP 3: Creating TRACKBOXD")
+    window = TrackboxdApp()
+
+    print("STEP 4: Showing window")
+    window.show()
+
+    print("STEP 5: Entering application loop")
+    sys.exit(app.exec())
